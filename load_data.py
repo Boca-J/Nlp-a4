@@ -68,10 +68,11 @@ class ModelContextualSimilarityDataset(Dataset):
 
     def __getitem__(self, idx):
         curr_dict = self.data[idx]
-        return curr_dict['word1_ids'], curr_dict['word1_mask'], curr_dict['span1'], curr_dict['word2_ids'], \
-            curr_dict['word2_mask'], curr_dict['span2'], curr_dict['word1'], curr_dict['word2']
 
-
+        #curr_dict['input_ids'] is the ids of the context sequence, including anything special tokens automatically added by the tokenizer (e.g., [CLS] and [SEP] tokens for bert) while excluding the <strong> tokens in the input.   
+        return curr_dict['input_ids'], curr_dict['attention_mask'], curr_dict['span1'], curr_dict['span2'], \
+            curr_dict['word1'], curr_dict['word2']
+            
 
 class ModelIsolatedSimilarityDataset(Dataset):
 
@@ -106,6 +107,7 @@ class ModelIsolatedSimilarityDataset(Dataset):
 
     def __getitem__(self, idx):
         curr_dict = self.data[idx]
+        #curr_dict['word1_ids'] and curr_dict['word2_ids'] are the ids corresponding to word1 and word2 respectively, including anything special tokens automatically added by the tokenizer (e.g., [CLS] and [SEP] tokens for bert). 
         return curr_dict['word1_ids'], curr_dict['word1_mask'], curr_dict['span1'], curr_dict['word2_ids'], \
             curr_dict['word2_mask'], curr_dict['span2'], curr_dict['word1'], curr_dict['word2']
 
