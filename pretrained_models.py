@@ -9,6 +9,8 @@ from torch.nn import init
 
 from load_data import load_data_pretrained_models
 from utils import get_similarity_scores, compute_spearman_correlation
+from transformers import AutoModel, AutoTokenizer
+
 
 DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
@@ -35,7 +37,38 @@ class PretrainedEmbeddingModel(nn.Module):
             layer_strategy (str): If we use multiple layers, how do we combine them?
         """
         # TODO
-        raise(NotImplementedError)
+        super().__init__()
+        self.model_name = model
+        if model == 'bert':
+            model = 'bert-base-uncased'
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model)
+        self.model = AutoModel.from_pretrained(model, output_hidden_states=True)
+        self.model.eval().to(DEVICE)
+
+
+        self.layers = [int(layer) for layer in layers.split(",")]  
+        self.merge_strategy = merge_strategy  
+        self.layer_merging = layer_merging 
+
+    def _combine_layers(self, hidden_states):
+        selected = [hidden_states[i] for i in self.layers]
+        if self.layer_merging == "mean":
+            return torch.mean(torch.stack(selected, dim=0), dim=0)
+        elif self.layer_merging == "sum":
+            return torch.sum(torch.stack(selected, dim=0), dim=0)
+        elif self.layer_merging == "last":
+            return selected[-1]
+        else:
+            raise ValueError("Unsupported layer_merging strategy")
+        
+    def _merge_subwords(self, token_embeddings):
+        if self.merge_strategy == "first":
+            return token_embeddings[0]
+        elif self.merge_strategy == "mean":
+            return torch.mean(token_embeddings, dim=0)
+        else:
+            raise ValueError("Unsupported merge strategy")
 
     def extract_embedding_from_outputs(self, model_output, word_span):
         """
@@ -54,7 +87,15 @@ class PretrainedEmbeddingModel(nn.Module):
             word_span (torch.LongTensor): A minibatch of word spans, where each span contains
                                           the start and end position of the word in the tokenized model input.
         """
-        pass
+        hidden_states = model_output.hidden_states
+        combined_hidden = self._combine_layers(hidden_states)
+
+        word_embeddings = []
+        for i, token_ids in enumerate(word_span):  # token_ids: List[int]
+            token_embed = combined_hidden[i, token_ids, :]  # shape: [num_subwords, dim]
+            merged_embed = self._merge_subwords(token_embed)
+            word_embeddings.append(merged_embed)
+        return word_embeddings
 
     def extract_isolated(self, isolated_data: Any):
         """
@@ -72,7 +113,24 @@ class PretrainedEmbeddingModel(nn.Module):
                                  in the order they appear.
         """
         # TODO
-        raise(NotImplementedError)
+        word1_embeds, word2_embeds = [], []
+
+        for w1_ids, w1_mask, span1, w2_ids, w2_mask, span2, word1, word2 in isolated_data:
+            for input_ids, mask, span, collector in zip(
+                [w1_ids, w2_ids],
+                [w1_mask, w2_mask],
+                [span1, span2],
+                [word1_embeds, word2_embeds]
+            ):  
+                if input_ids.dim() == 1:
+                    input_ids = input_ids.unsqueeze(0)
+                input_ids = input_ids.to(DEVICE)
+                
+                outputs = self.model(input_ids)
+                embed = self.extract_embedding_from_outputs(outputs, [span])[0]
+                collector.append(embed.cpu().detach())
+
+        return word1_embeds, word2_embeds
 
     def extract_contextual(self, contextual_data: Any):
         """
@@ -90,14 +148,40 @@ class PretrainedEmbeddingModel(nn.Module):
                                  in the order they appear.
         """
         # TODO
-        raise(NotImplementedError)
+        word1_embeds, word2_embeds = [], []
+
+        for input_ids, attention_mask, span1, span2, word1, word2 in contextual_data:
+
+            if input_ids.dim() == 1:
+                input_ids = input_ids.unsqueeze(0)
+            if attention_mask.dim() == 1:
+                attention_mask = attention_mask.unsqueeze(0)
+            
+            input_ids = input_ids.to(DEVICE)
+            attention_mask = attention_mask.to(DEVICE)
+
+            # input_ids = input_ids.clone().detach().unsqueeze(0).to(DEVICE)
+            # attention_mask = attention_mask.clone().detach().unsqueeze(0).to(DEVICE)
+
+            # input_ids = input_ids.unsqueeze(0).to(DEVICE) if isinstance(input_ids, torch.Tensor) else torch.tensor(input_ids).unsqueeze(0).to(DEVICE)
+            # attention_mask = attention_mask.unsqueeze(0).to(DEVICE) if isinstance(attention_mask, torch.Tensor) else torch.tensor(attention_mask).unsqueeze(0).to(DEVICE)
+
+
+            outputs = self.model(input_ids, attention_mask=attention_mask)
+
+            for span, collector in zip([span1, span2], [word1_embeds, word2_embeds]):
+                if not span: continue
+                embed = self.extract_embedding_from_outputs(outputs, [span])[0]
+                collector.append(embed.cpu().detach())
+
+        return word1_embeds, word2_embeds
 
 def get_args():
     """
     You may freely add new command line arguments to this function, or change them.
     """
     parser = argparse.ArgumentParser(description='word2vec model')
-    parser.add_argument('-m', '--model_type', type='str', choices=['gpt2', 'bert'],
+    parser.add_argument('-m', '--model_type', type=str, choices=['gpt2', 'bert'],
                         help='Which pretrained model will we use?')
     
     parser.add_argument('-l', '--layers', type=str, default='12',
@@ -115,6 +199,8 @@ def get_args():
 def main():
     args = get_args()
     model_type = args.model_type
+    # if model_type == 'bert':
+    #     model_type = "bert-base-uncased"
     layers = args.layers
     merge_strategy = args.subword_merging
     layer_merging = args.layer_merging
@@ -144,18 +230,18 @@ def main():
     cont_test_sim_scores = get_similarity_scores(cont_test_embeds_word1, cont_test_embeds_word2)
 
     # Evaluate your similarity scores against human ratings
-    isol_dev_corr = compute_spearman_correlation(isol_dev_sim_scores, isol_dev_labels)
-    isol_test_corr = compute_spearman_correlation(isol_test_sim_scores, isol_test_labels)
-    cont_dev_corr = compute_spearman_correlation(cont_dev_sim_scores, cont_dev_labels)
-    cont_test_corr = compute_spearman_correlation(cont_test_sim_scores, cont_test_labels)
+    isol_dev_corr = compute_spearman_correlation(isol_dev_sim_scores, isol_dev_data.labels)
+    # isol_test_corr = compute_spearman_correlation(isol_test_sim_scores, isol_test_data.labels)
+    cont_dev_corr = compute_spearman_correlation(cont_dev_sim_scores, cont_dev_data.labels)
+    # cont_test_corr = compute_spearman_correlation(cont_test_sim_scores, cont_test_data.labels)
 
     print("\n\n\nEvaluating on: isolated word pairs")
     print("Correlation score on dev set:", isol_dev_corr)
-    print("Correlation score on test set:", isol_test_corr)
+    # print("Correlation score on test set:", isol_test_corr)
 
     print("\n\n\nEvaluating on: contextual word pairs")
     print("Correlation score on dev set:", cont_dev_corr)
-    print("Correlation score on test set:", cont_test_corr)
+    # print("Correlation score on test set:", cont_test_corr)
 
 
 if __name__ == "__main__":

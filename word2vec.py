@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from tqdm import tqdm
 from torch.nn import init
 
 from load_data import load_data_word2vec
@@ -12,7 +13,7 @@ from utils import get_similarity_scores, compute_spearman_correlation
 
 
 DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-
+# DEVICE = 'cpu'
 
 class Word2vec(nn.Module):
     """
@@ -30,7 +31,17 @@ class Word2vec(nn.Module):
             embed_dim (int): Dimensionality of the word embeddings
         """
         # TODO
-        raise(NotImplementedError)
+        super(Word2vec, self).__init__()
+        self.embed_dim = embed_dim
+        self.vocab_size = vocab_size
+        
+        
+        self.input_embeddings = nn.Embedding(vocab_size, embed_dim)
+        self.context_embeddings = nn.Embedding(vocab_size, embed_dim)
+        
+       
+        init.xavier_uniform_(self.input_embeddings.weight)
+        init.xavier_uniform_(self.context_embeddings.weight)
 
     def forward(self, input_tokens: torch.Tensor, context_tokens: torch.Tensor, negative_context: Optional[torch.Tensor] = None):
         """
@@ -47,7 +58,14 @@ class Word2vec(nn.Module):
             negative_embeds (torch.Tensor): Embeddings of negative context words
         """
         # TODO
-        raise(NotImplementedError)
+        input_embeds = self.input_embeddings(input_tokens)
+        context_embeds = self.context_embeddings(context_tokens)
+        
+        negative_embeds = None
+        if negative_context is not None:
+            negative_embeds = self.context_embeddings(negative_context)
+        
+        return input_embeds, context_embeds, negative_embeds
     
     def compute_loss(self, input_embeds: torch.Tensor, context_embeds: torch.Tensor, negative_embeds: Optional[torch.Tensor] = None):
         """
@@ -63,9 +81,24 @@ class Word2vec(nn.Module):
             loss (torch.Tensor)
         """
         # TODO
-        raise(NotImplementedError)
+        batch_size = input_embeds.shape[0]  # This is |D|, the number of positive pairs
+
+        # Compute positive pair loss
+        pos_loss = F.logsigmoid(torch.bmm(input_embeds.unsqueeze(1), context_embeds.unsqueeze(2)).squeeze())
+
+        if negative_embeds is not None:
+            # Compute negative pair loss
+            neg_loss = F.logsigmoid(-torch.bmm(input_embeds.unsqueeze(1), negative_embeds.permute(0, 2, 1))).sum(dim=-1)
+
+            # ✅ Explicitly divide by |D|
+            loss = -(pos_loss.sum() + neg_loss.sum()) / batch_size
+        else:
+            # ✅ Explicitly divide by |D|
+            loss = -pos_loss.sum() / batch_size
+
+        return loss
     
-    def pred(self, input_tokens: torch.Tensor):
+    def pred(self, input_tokens: torch.Tensor, detach: bool = True, to_cpu: bool = True):
         """
         Predicts the embeddings of the input tokens.
 
@@ -76,15 +109,58 @@ class Word2vec(nn.Module):
             embeds (torch.Tensor): Embeddings of input words
         """
         # TODO
-        raise(NotImplementedError)
+        embeds = self.input_embeddings(input_tokens)
+
+        if detach:
+            embeds = embeds.detach()
+        if to_cpu:
+            embeds = embeds.cpu()
+
+        return embeds
     
-    def learn(self, train_data, num_epochs: int):
+    def learn(self, train_data, num_epochs: int,  dev_data):
         """
         Training word2vec model.
         You may change the header as you see fit.
         """
         # TODO
-        raise(NotImplementedError)
+        optimizer = optim.Adam(self.parameters(), lr=0.001)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+
+        spearman_scores = []
+        total_batches = len(train_data)  # Total number of batches per epoch
+       
+
+        for epoch in range(num_epochs):
+            total_loss = 0
+            progress_bar = tqdm(train_data, desc=f"Epoch {epoch+1}/{num_epochs}", unit="batch", leave=True)
+            # for input_tokens, context_tokens, negative_context in train_data:
+            for batch in progress_bar:  # ✅ Corrected loop
+                input_tokens, context_tokens, negative_context = batch
+
+                
+                input_tokens = input_tokens.to(DEVICE)
+                context_tokens = context_tokens.to(DEVICE)
+                negative_context = negative_context.to(DEVICE)
+
+                optimizer.zero_grad()
+                input_embeds, context_embeds, negative_embeds = self.forward(input_tokens, context_tokens, negative_context)
+                loss = self.compute_loss(input_embeds, context_embeds, negative_embeds)
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item()
+
+            print(f"Epoch {epoch+1}, Loss: {total_loss:.4f}")
+            scheduler.step(total_loss)
+        
+            dev_embeds_word1 = self.pred(dev_data.word1_ids.to(DEVICE))
+            dev_embeds_word2 = self.pred(dev_data.word2_ids.to(DEVICE))
+            dev_sim_scores = get_similarity_scores(dev_embeds_word1.detach(), dev_embeds_word2.detach())
+            dev_corr = compute_spearman_correlation(dev_sim_scores, dev_data.labels)
+            spearman_scores.append(dev_corr)
+
+      
 
 
 def get_args():
@@ -130,9 +206,9 @@ def main():
     experiment_name = args.experiment_name
 
     # Load data
-    train_dataset, train_loader, cont_dev_data, cont_test_data, isol_dev_data, isol_test_data = load_data_word2vec()
+    train_dataset, train_loader, cont_dev_data, cont_test_data, isol_dev_data, isol_test_data, vocab = load_data_word2vec()
     
-    vocab_size = train_dataset.vocab_size
+    vocab_size = len(vocab)
 
     model = Word2vec(vocab_size, embed_dim)
     model = model.to(DEVICE)
@@ -140,7 +216,7 @@ def main():
     # Could: add the optimizer / scheduler
 
     # Training
-    model.learn(train_loader, num_epochs)
+    model.learn(train_loader, num_epochs, isol_dev_data)
 
     # Could: save the model
 
@@ -161,6 +237,7 @@ def main():
     # Could: save the embeddings to text file
 
     # Compute word pair similarity scores using your embedding
+
     isol_dev_sim_scores = get_similarity_scores(isol_dev_embeds_word1, isol_dev_embeds_word2)
     isol_test_sim_scores = get_similarity_scores(isol_test_embeds_word1, isol_test_embeds_word2)
     cont_dev_sim_scores = get_similarity_scores(cont_dev_embeds_word1, cont_dev_embeds_word2)
@@ -170,18 +247,19 @@ def main():
     ## Read the labels
 
     ## Compute the scores
-    isol_dev_corr = compute_spearman_correlation(isol_dev_sim_scores, isol_dev_labels)
-    isol_test_corr = compute_spearman_correlation(isol_test_sim_scores, isol_test_labels)
-    cont_dev_corr = compute_spearman_correlation(cont_dev_sim_scores, cont_dev_labels)
-    cont_test_corr = compute_spearman_correlation(cont_test_sim_scores, cont_test_labels)
+    isol_dev_corr = compute_spearman_correlation(isol_dev_sim_scores, isol_dev_data.labels)
+    # isol_test_corr = compute_spearman_correlation(isol_test_sim_scores, isol_test_data.labels)
+    cont_dev_corr = compute_spearman_correlation(cont_dev_sim_scores, cont_dev_data.labels)
+    # cont_test_corr = compute_spearman_correlation(cont_test_sim_scores, cont_test_data.labels)
+
 
     print("Evaluating on: word pairs in isolation")
     print("Correlation score on dev set:", isol_dev_corr)
-    print("Correlation score on test set:", isol_test_corr)
+    # print("Correlation score on test set:", isol_test_corr)
 
     print("\nEvaluating on: word pairs in context")
     print("Correlation score on dev set:", cont_dev_corr)
-    print("Correlation score on test set:", cont_test_corr)
+    # print("Correlation score on test set:", cont_test_corr)
 
 
 if __name__ == "__main__":
