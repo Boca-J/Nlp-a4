@@ -92,7 +92,9 @@ class PretrainedEmbeddingModel(nn.Module):
 
         word_embeddings = []
         for i, token_ids in enumerate(word_span):  # token_ids: List[int]
-            token_embed = combined_hidden[i, token_ids, :]  # shape: [num_subwords, dim]
+            # token_embed = combined_hidden[i, token_ids, :]  # shape: [num_subwords, dim]
+            token_embed = combined_hidden[i, token_ids.view(-1), :]
+
             merged_embed = self._merge_subwords(token_embed)
             word_embeddings.append(merged_embed)
         return word_embeddings
@@ -170,7 +172,7 @@ class PretrainedEmbeddingModel(nn.Module):
             outputs = self.model(input_ids, attention_mask=attention_mask)
 
             for span, collector in zip([span1, span2], [word1_embeds, word2_embeds]):
-                if not span: continue
+                # if not span: continue
                 embed = self.extract_embedding_from_outputs(outputs, [span])[0]
                 collector.append(embed.cpu().detach())
 
@@ -196,6 +198,13 @@ def get_args():
     args = parser.parse_args()
     return args
 
+def save_embeddings(filepath, words, embeddings):
+    with open(filepath, "w") as f:
+        for word, vec in zip(words, embeddings):
+            vec_str = " ".join(f"{x:.6f}" for x in vec)
+            f.write(f"{word} {vec_str}\n")
+
+
 def main():
     args = get_args()
     model_type = args.model_type
@@ -207,8 +216,10 @@ def main():
     experiment_name = args.experiment_name
 
     # Load data
-    cont_dev_data, cont_test_data, isol_dev_data, isol_test_data = load_data_pretrained_models(model_type)
+    cont_dev_data, cont_test_data, isol_dev_data, isol_test_data, isol_dev_labels, cont_dev_labels = load_data_pretrained_models(model_type)
 
+
+   
     # Load model
     model = PretrainedEmbeddingModel(model_type, layers, merge_strategy, layer_merging)
     model.to(DEVICE)
@@ -222,6 +233,27 @@ def main():
     cont_test_embeds_word1, cont_test_embeds_word2 = model.extract_contextual(cont_test_data) 
 
     # Save the embeddings to text file
+    save_embeddings(
+        f"results/{model_type}_isol_test_words1_embeddings.txt",
+        [w1 for _, _, _, _, _, _, w1, _ in isol_test_data],
+        isol_test_embeds_word1
+    )
+    save_embeddings(
+        f"results/{model_type}_isol_test_words2_embeddings.txt",
+        [w2 for _, _, _, _, _, _, _, w2 in isol_test_data],
+        isol_test_embeds_word2
+    )
+
+    save_embeddings(
+        f"results/{model_type}_cont_test_words1_embeddings.txt",
+        [w1 for _, _, _, _, w1, _ in cont_test_data],
+        cont_test_embeds_word1
+    )
+    save_embeddings(
+        f"results/{model_type}_cont_test_words2_embeddings.txt",
+        [w2 for _, _, _, _, _, w2 in cont_test_data],
+        cont_test_embeds_word2
+    )
 
     # Compute word pair similarity scores using your embedding
     isol_dev_sim_scores = get_similarity_scores(isol_dev_embeds_word1, isol_dev_embeds_word2)
@@ -230,9 +262,9 @@ def main():
     cont_test_sim_scores = get_similarity_scores(cont_test_embeds_word1, cont_test_embeds_word2)
 
     # Evaluate your similarity scores against human ratings
-    isol_dev_corr = compute_spearman_correlation(isol_dev_sim_scores, isol_dev_data.labels)
+    isol_dev_corr = compute_spearman_correlation(isol_dev_sim_scores, isol_dev_labels)
     # isol_test_corr = compute_spearman_correlation(isol_test_sim_scores, isol_test_data.labels)
-    cont_dev_corr = compute_spearman_correlation(cont_dev_sim_scores, cont_dev_data.labels)
+    cont_dev_corr = compute_spearman_correlation(cont_dev_sim_scores, cont_dev_labels)
     # cont_test_corr = compute_spearman_correlation(cont_test_sim_scores, cont_test_data.labels)
 
     print("\n\n\nEvaluating on: isolated word pairs")

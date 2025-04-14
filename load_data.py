@@ -251,14 +251,15 @@ class ModelContextualSimilarityDataset(Dataset):
     def __init__(self, model_type, x_csv, y_csv):
         # Get tokenizer
         if model_type == "gpt2":
-            tokenizer = AutoTokenizer.from_pretrained('gpt2')
+            tokenizer = AutoTokenizer.from_pretrained('openai-community/gpt2')
             tokenizer.pad_token = tokenizer.eos_token
         else:
-            tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+            tokenizer = AutoTokenizer.from_pretrained("google-bert/bert-base-uncased")
+         
 
         # Compute maximum length in either case
         self.max_len = self.get_max_len(x_csv, tokenizer)
-
+        self.tokenizer = tokenizer
         # Process each input
         self.data = []
         self.process_data(model_type, tokenizer, x_csv, y_csv)
@@ -270,13 +271,13 @@ class ModelContextualSimilarityDataset(Dataset):
     
     def get_max_len(self, x_csv, tokenizer):
         # TODO
-        df = pd.read_csv(x_csv)
+       
         max_len = 0
-        for text in df["context"]:
+        for text in x_csv["context"]:
             clean_text = re.sub(r"</?strong>", "", text)
             tokens = tokenizer(clean_text, add_special_tokens=True)
             max_len = max(max_len, len(tokens["input_ids"]))
-
+      
         return max_len
 
     def process_data(self, model_type, tokenizer, x_csv, y_csv):
@@ -284,42 +285,81 @@ class ModelContextualSimilarityDataset(Dataset):
         # you can define any number of helper functions to do this.
         # make sure the data are processed and added to self.data in the order they appear. 
         ## TODO
-        df_x = pd.read_csv(x_csv)
-        word1_list = df_x["word1"].tolist()
-        word2_list = df_x["word2"].tolist()
-        context_list = df_x["context"].tolist()
+  
+        word1_list = x_csv["word1"].tolist()
+        word2_list = x_csv["word2"].tolist()
+        word1_context_list = x_csv["word1_context"].tolist()
+        word2_context_list = x_csv["word2_context"].tolist()
+        context_list = x_csv["context"].tolist()    
 
-        for word1, word2, context in zip(word1_list, word2_list, context_list):
-            # Find <strong> spans and remove tags
-            clean_context = re.sub(r"</?strong>", "", context)
+        def clean_and_map(text):
+            cleaned = ""
+            mapping = {}  # original_index → cleaned_index
+            cleaned_idx = 0
+            i = 0
+            while i < len(text):
+                if text.startswith("<strong>", i):
+                    i += len("<strong>")
+                elif text.startswith("</strong>", i):
+                    i += len("</strong>")
+                else:
+                    mapping[i] = cleaned_idx
+                    cleaned += text[i]
+                    i += 1
+                    cleaned_idx += 1
+            return cleaned, mapping
+        
+    
+        for word1, word2, context,word1_context, word2_context in zip(word1_list, word2_list, context_list, word1_context_list, word2_context_list):
+            
+            matches = list(re.finditer(r"<strong>(.*?)</strong>", context))
+            clean_context, char_mapping = clean_and_map(context)
+                        
+            tempidx1 = matches[0].start(1), matches[0].end(1) 
+            tempidx2 = matches[1].start(1), matches[1].end(1)
 
-            # Tokenize for model input
-            encoded = tokenizer(clean_context, padding='max_length', max_length=self.max_len,
-                                return_attention_mask=True, return_offsets_mapping=True,
-                                truncation=True, return_tensors="pt")
+            if context[tempidx1[0]:tempidx1[1]] == word1_context:
+                span1_orig = tempidx1
+                span2_orig = tempidx2
 
-            input_ids = encoded["input_ids"].squeeze()
-            attention_mask = encoded["attention_mask"].squeeze()
+            else:
+                span1_orig = tempidx2
+                span2_orig = tempidx1
+
+            # Convert to cleaned span
+            span1_chars = char_mapping[span1_orig[0]], char_mapping[span1_orig[1] - 1] + 1
+            span2_chars = char_mapping[span2_orig[0]], char_mapping[span2_orig[1] - 1] + 1
+
+        
+            
+            # Tokenize
+            encoded = tokenizer(
+                # context,
+                clean_context,
+                # padding=True,                     
+                # truncation=False,
+                # return_attention_mask=True,
+                return_offsets_mapping=True,
+                return_tensors="pt"
+            )
+
+            # input_ids = encoded["input_ids"].to(torch.long)
+            input_ids = encoded["input_ids"].squeeze(0).to(torch.long)
+            attention_mask = encoded["attention_mask"].squeeze().to(torch.long)
             offsets = encoded["offset_mapping"].squeeze().tolist()
 
-            # Find character positions of strong-tagged words in original context
-            def get_char_span(tagged_context, target_idx):
-                # Match using regex
-                matches = list(re.finditer(r"<strong>(.*?)</strong>", tagged_context))
-                match = matches[target_idx]
-                return match.start(1), match.end(1)
-
-            span1_chars = get_char_span(context, 0)  # First <strong>
-            span2_chars = get_char_span(context, 1)  # Second <strong>
-
-            # Map character spans to token indices
             def get_token_span(char_span, offsets):
-                return [i for i, (s, e) in enumerate(offsets) if s >= char_span[0] and e <= char_span[1]]
+                start, end = char_span
+                return torch.tensor(
+                    [i for i, (s, e) in enumerate(offsets) if ((s >= start  and e < end) or (s < start  and start <= e < end) or (s < end  and e >= end)) or (s <= start and e >= end) ],
+                    # [i for i, (s, e) in enumerate(offsets) if not (e <= start or s >= end)]
+                    dtype=torch.long
+            )
 
             span1 = get_token_span(span1_chars, offsets)
             span2 = get_token_span(span2_chars, offsets)
 
-            # Save
+
             self.data.append({
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
@@ -329,79 +369,89 @@ class ModelContextualSimilarityDataset(Dataset):
                 "word2": word2
             })
 
+            # print(f"Clean context: {clean_context}")
+            # print("Decoded full input:", tokenizer.decode(encoded['input_ids'][0]))
+            # print("Tokens:", tokenizer.convert_ids_to_tokens(encoded['input_ids'][0]))
+        
+            # if word1 == 'car' or word2 == 'carriage':
+            #     print(input_ids) 
+            #     print(clean_context)
+            #     print(span1_chars)
+            #     print(offsets)
+            #     exit()
+
     def __getitem__(self, idx):
         curr_dict = self.data[idx]
+        span1 = curr_dict["span1"]
+        span2 = curr_dict["span2"]
+        # print(span1)
+        # print(span2)
+    
+        input_ids = curr_dict["input_ids"]
+        
 
+
+        decoded_span1 = self.tokenizer.decode(input_ids[span1])
+        decoded_span2 = self.tokenizer.decode(input_ids[span2])
+
+        # print(f"Index {idx}:")
+        # print(f"  word1 = {curr_dict['word1']} → decoded_span1 = '{decoded_span1}'")
+        # print(f"  word2 = {curr_dict['word2']} → decoded_span2 = '{decoded_span2}'")
+
+            
+
+        # print(f"Index {idx}: span1 = {curr_dict['span1']} --> tensor shape = {curr_dict['span1'].shape}")
         #curr_dict['input_ids'] is the ids of the context sequence, including anything special tokens automatically added by the tokenizer (e.g., [CLS] and [SEP] tokens for bert) while excluding the <strong> tokens in the input.   
         return (
-            torch.tensor(curr_dict['input_ids']),
-            torch.tensor(curr_dict['attention_mask']),
-            curr_dict['span1'],
-            curr_dict['span2'],
+            curr_dict['input_ids'],
+            curr_dict['attention_mask'],
+            span1,
+            span2,
             curr_dict['word1'],
             curr_dict['word2']
         )
             
 
 class ModelIsolatedSimilarityDataset(Dataset):
-
     def __init__(self, model_type, x_csv, y_csv):
-        # Get tokenizer
         if model_type == "gpt2":
-            tokenizer = AutoTokenizer.from_pretrained('gpt2')
+            tokenizer = AutoTokenizer.from_pretrained('openai-community/gpt2')
             tokenizer.pad_token = tokenizer.eos_token
         else:
-            tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+            tokenizer = AutoTokenizer.from_pretrained("google-bert/bert-base-uncased")
 
-        # Compute maximum length in either case
-        self.max_len = self.get_max_len(x_csv, tokenizer)
-        
-        # Process each input
+        self.tokenizer = tokenizer
         self.data = []
-        self.process_data(model_type, tokenizer, x_csv, y_csv)
-        self.tokenizer=tokenizer
+        self.process_data(tokenizer, x_csv, y_csv)
 
     def __len__(self):
         return len(self.data)
 
-    def get_max_len(self, x_csv, tokenizer):
-        # TODO
-        df = pd.read_csv(x_csv)
-        word1_list = df["word1"].tolist()
-        word2_list = df["word2"].tolist()
-
-        max_len = 0
-        for word in word1_list + word2_list:
-            tokens = tokenizer(word, add_special_tokens=True)
-            max_len = max(max_len, len(tokens["input_ids"]))
-        return max_len
-
-    def process_data(self, model_type, tokenizer, x_csv, y_csv):
-        # you can define any number of helper functions to do this.
-        # make sure the data are processed and added to self.data in the order they appear. 
-        df = pd.read_csv(x_csv)
-        
-        word1_list = df["word1"].tolist()
-        word2_list = df["word2"].tolist()
+    def process_data(self, tokenizer, x_csv, y_csv):
+        word1_list = x_csv["word1"].tolist()
+        word2_list = x_csv["word2"].tolist()
 
         for w1, w2 in zip(word1_list, word2_list):
             data_point = {}
 
             for word, label in zip([w1, w2], ["word1", "word2"]):
-                encoded = tokenizer(word,
-                                    padding="max_length",
-                                    max_length=self.max_len,
-                                    return_attention_mask=True,
-                                    return_offsets_mapping=True,
-                                    truncation=True)
+                encoded = tokenizer(
+                    word,
+                    return_attention_mask=True,
+                    return_offsets_mapping=True,
+                    return_tensors="pt"
+                )
 
-                input_ids = encoded["input_ids"]
-                attention_mask = encoded["attention_mask"]
-                offsets = encoded["offset_mapping"]
+                input_ids = encoded["input_ids"].squeeze(0).to(torch.long)
+                attention_mask = encoded["attention_mask"].squeeze().to(torch.long)
+                # offsets = encoded["offset_mapping"].squeeze().tolist()
+                offsets = encoded["offset_mapping"][0].to(torch.long)
 
-                # Token span: skip special tokens if model adds them (assume special tokens are at ends)
-                token_span = [i for i, (start, end) in enumerate(offsets)
-                            if start != 0 or end != 0]  # Ignore special tokens with (0, 0)
+                # Exclude special tokens (e.g., [CLS], [SEP]) by skipping offsets with (0, 0)
+                token_span = torch.tensor(
+                    [i for i, (s, e) in enumerate(offsets) if (s, e) != (0, 0)],
+                    dtype=torch.long
+                )
 
                 data_point[f"{label}_ids"] = input_ids
                 data_point[f"{label}_mask"] = attention_mask
@@ -412,13 +462,31 @@ class ModelIsolatedSimilarityDataset(Dataset):
 
     def __getitem__(self, idx):
         curr_dict = self.data[idx]
-        #curr_dict['word1_ids'] and curr_dict['word2_ids'] are the ids corresponding to word1 and word2 respectively, including anything special tokens automatically added by the tokenizer (e.g., [CLS] and [SEP] tokens for bert). 
+        # input_ids = curr_dict["input_ids"]
+        span1 = curr_dict['span1']
+        span2 = curr_dict['span2']
+        # print(span1)
+        # print(span2)
+        input_ids1 = curr_dict["word1_ids"]
+        input_ids2 = curr_dict["word2_ids"]
+
+        decoded_span1 = self.tokenizer.decode(input_ids1[span1])
+        decoded_span2 = self.tokenizer.decode(input_ids2[span2])
+
+        # span11 = torch.tensor([0, 3])
+        # span22 = torch.tensor([0, 1])
+        # decoded_span1 = self.tokenizer.decode(input_ids1[span11])
+        # decoded_span2 = self.tokenizer.decode(input_ids2[span22])
+
+        # print(f"Index {idx}:")
+        # print(f"  word1 = {curr_dict['word1']} → decoded_span1 = '{decoded_span1}'")
+        # print(f"  word2 = {curr_dict['word2']} → decoded_span2 = '{decoded_span2}'")
         return (
-            torch.tensor(curr_dict['word1_ids']),
-            torch.tensor(curr_dict['word1_mask']),
+            curr_dict['word1_ids'],
+            curr_dict['word1_mask'],
             curr_dict['span1'],
-            torch.tensor(curr_dict['word2_ids']),
-            torch.tensor(curr_dict['word2_mask']),
+            curr_dict['word2_ids'],
+            curr_dict['word2_mask'],
             curr_dict['span2'],
             curr_dict['word1'],
             curr_dict['word2']
@@ -461,28 +529,31 @@ def load_data_pretrained_models(model_type: str):
         raise ValueError("Invalid model_type. Use 'bert' or 'gpt2'.")
 
     # Paths to CSV files
-    CONTEXT_DEV_X = "data/contextual_similarity/contextual_dev_x.csv"
-    CONTEXT_DEV_Y = "data/contextual_similarity/contextual_dev_y.csv"
-    CONTEXT_TEST_X = "data/contextual_similarity/contextual_test_x.csv"
-    CONTEXT_TEST_Y = "data/contextual_similarity/contextual_test_y.csv"  # if exists
+    CONTEXT_DEV_X = pd.read_csv("data/contextual_similarity/contextual_dev_x.csv")
+    CONTEXT_DEV_Y = pd.read_csv("data/contextual_similarity/contextual_dev_y.csv")
+    CONTEXT_TEST_X = pd.read_csv("data/contextual_similarity/contextual_test_x.csv")
 
-    ISOLATED_DEV_X = "data/isolated_similarity/isolated_dev_x.csv"
-    ISOLATED_DEV_Y = "data/isolated_similarity/isolated_dev_y.csv"
-    ISOLATED_TEST_X = "data/isolated_similarity/isolated_test_x.csv"
-    ISOLATED_TEST_Y = "data/isolated_similarity/isolated_test_y.csv"  # if exists
+    ISOLATED_DEV_X = pd.read_csv("data/isolated_similarity/isolated_dev_x.csv")
+    ISOLATED_DEV_Y = pd.read_csv("data/isolated_similarity/isolated_dev_y.csv")
+    ISOLATED_TEST_X = pd.read_csv("data/isolated_similarity/isolated_test_x.csv")
+    # Optionally wrap in DataLoader (batch_size=1 to keep control over individual inputs)
+    # You can skip this step if your model works directly with the dataset objects.
+
+    DUMMY_Y = pd.DataFrame()
 
     # Instantiate datasets
     cont_dev_data = ModelContextualSimilarityDataset(model_name, CONTEXT_DEV_X, CONTEXT_DEV_Y)
-    cont_test_data = ModelContextualSimilarityDataset(model_name, CONTEXT_TEST_X, CONTEXT_TEST_Y)
+    cont_test_data = ModelContextualSimilarityDataset(model_name, CONTEXT_TEST_X, DUMMY_Y)
     isol_dev_data = ModelIsolatedSimilarityDataset(model_name, ISOLATED_DEV_X, ISOLATED_DEV_Y)
-    isol_test_data = ModelIsolatedSimilarityDataset(model_name, ISOLATED_TEST_X, ISOLATED_TEST_Y)
+    isol_test_data = ModelIsolatedSimilarityDataset(model_name, ISOLATED_TEST_X, DUMMY_Y)
 
-    # Optionally wrap in DataLoader (batch_size=1 to keep control over individual inputs)
-    # You can skip this step if your model works directly with the dataset objects.
     cont_dev_loader = DataLoader(cont_dev_data, batch_size=1, shuffle=False)
     cont_test_loader = DataLoader(cont_test_data, batch_size=1, shuffle=False)
     isol_dev_loader = DataLoader(isol_dev_data, batch_size=1, shuffle=False)
     isol_test_loader = DataLoader(isol_test_data, batch_size=1, shuffle=False)
 
-    return cont_dev_loader, cont_test_loader, isol_dev_loader, isol_test_loader
+    isol_dev_labels = torch.tensor(ISOLATED_DEV_Y["sim"].tolist(), dtype=torch.float32)
+    cont_dev_labels = torch.tensor(CONTEXT_DEV_Y["sim"].tolist(), dtype=torch.float32)
+
+    return cont_dev_loader, cont_test_loader, isol_dev_loader, isol_test_loader, isol_dev_labels, cont_dev_labels
     
