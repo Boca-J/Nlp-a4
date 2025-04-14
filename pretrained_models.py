@@ -235,23 +235,23 @@ def main():
     # Save the embeddings to text file
     save_embeddings(
         f"results/{model_type}_isol_test_words1_embeddings.txt",
-        [w1 for _, _, _, _, _, _, w1, _ in isol_test_data],
+        [w1[0] for _, _, _, _, _, _, w1, _ in isol_test_data],
         isol_test_embeds_word1
     )
     save_embeddings(
         f"results/{model_type}_isol_test_words2_embeddings.txt",
-        [w2 for _, _, _, _, _, _, _, w2 in isol_test_data],
+        [w2[0] for _, _, _, _, _, _, _, w2 in isol_test_data],
         isol_test_embeds_word2
     )
 
     save_embeddings(
         f"results/{model_type}_cont_test_words1_embeddings.txt",
-        [w1 for _, _, _, _, w1, _ in cont_test_data],
+        [w1[0] for _, _, _, _, w1, _ in cont_test_data],
         cont_test_embeds_word1
     )
     save_embeddings(
         f"results/{model_type}_cont_test_words2_embeddings.txt",
-        [w2 for _, _, _, _, _, w2 in cont_test_data],
+        [w2[0] for _, _, _, _, _, w2 in cont_test_data],
         cont_test_embeds_word2
     )
 
